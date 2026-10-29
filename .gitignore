@@ -5,7 +5,9 @@ __pycache__/
 *.egg-info/
 *.egg
 dist/
+dist-*/
 build/
+build-*/
 .eggs/
 
 # ─── Testing ────────────────────────────────────────────────────────
@@ -34,6 +36,7 @@ ENV/
 # data and can be very large.
 input/
 output/
+outputs/
 *.output.xlsx
 
 # ─── Temporary and generated files ──────────────────────────────────

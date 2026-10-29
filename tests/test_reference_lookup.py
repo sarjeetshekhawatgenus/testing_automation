@@ -29,6 +29,49 @@ def test_duplicate_reference_value_is_ambiguous():
     assert result.is_ambiguous
 
 
+def test_invalid_reference_uuid_is_not_returned():
+    df = reference_frame()
+    df.loc[df["name"] == "TOD", "id"] = "NOT-A-UUID"
+    lookup = ReferenceLookup()
+    lookup.load_from_dataframe(df)
+    result = lookup.lookup_by_name("CONSUMER IDENTIFICATION", "TOD")
+    assert not result.success
+    assert result.uuid == ""
+    assert result.is_invalid
+
+
+def test_missing_reference_uuid_is_not_hidden_when_another_row_matches():
+    df = reference_frame()
+    extra = pd.DataFrame([{
+        "id": "",
+        "name": "TOD",
+        "code": "99",
+        "master_name": "CONSUMER IDENTIFICATION",
+    }])
+    lookup = ReferenceLookup()
+    lookup.load_from_dataframe(pd.concat([df, extra], ignore_index=True))
+    result = lookup.lookup_by_name("CONSUMER IDENTIFICATION", "TOD")
+    assert not result.success
+    assert result.uuid == ""
+    assert result.is_invalid
+
+
+def test_valid_and_invalid_conflicting_reference_rows_are_not_arbitrated():
+    df = reference_frame()
+    extra = pd.DataFrame([{
+        "id": "NOT-A-UUID",
+        "name": "TOD",
+        "code": "99",
+        "master_name": "CONSUMER IDENTIFICATION",
+    }])
+    lookup = ReferenceLookup()
+    lookup.load_from_dataframe(pd.concat([df, extra], ignore_index=True))
+    result = lookup.lookup_by_name("CONSUMER IDENTIFICATION", "TOD")
+    assert not result.success
+    assert result.uuid == ""
+    assert result.is_invalid
+
+
 def test_meter_make_does_not_cross_categories():
     lookup = ReferenceLookup()
     lookup.load_from_dataframe(reference_frame())

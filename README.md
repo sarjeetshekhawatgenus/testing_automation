@@ -20,12 +20,16 @@ The application supports nine source-to-destination category operations across *
 - **Reference UUID resolution** — Business values (meter make, consumer status, phase type, etc.) are resolved to UUIDs from the template's `ref_project_masters_lov` worksheet.
 - **Category-specific meter-make mapping** — Meter-make lookups use the destination category's reference table (WC METER MAKE, LTCT METER MAKE, or HTCT METER MAKE).
 - **Network hierarchy matching** — Resolves DISCOM → Zone → Circle → Division → Subdivision → Substation → Feeder → DT identifiers with parent-qualified disambiguation.
+- **Human-approved hierarchy corrections** — Shows a unique suggested correction for mismatched source identifiers and requires explicit acceptance before the record is considered resolved.
 - **Consumer identification business rules** — WC → HTCT/LTCT with ESC auto-resolves to TOD (Rule A); HTCT/LTCT → WC uses source identification (Rule B).
 - **UUID formatting** — Every UUID written to the output is normalised to `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`. Double braces are collapsed, invalid UUIDs are flagged.
 - **Dry-run validation** — Full transformation and validation before generating the output workbook.
 - **Audit and error reports** — Downloadable per-record audit log and error report as Excel files.
-- **Large file support** — Configured for up to 3 GB per file upload (see [Limitations](#limitations)).
-- **CSV streaming** — Large CSV files are inspected using chunked reading to reduce memory usage.
+- **Field-level provenance** — Audit fields include the input value, resolved business value, output value, and resolution method.
+- **Large file preflight** — Estimates peak memory use and warns before processing large files.
+- **Processing progress and cancellation** — Shows processed-record counts and can stop a long run.
+- **Repeated-value acceleration** — Reuses hierarchy and reference lookup results for repeated values.
+- **CSV streaming** — Large CSV files are inspected in chunks without storing every identifier during upload checks.
 
 ## Supported Operations
 
@@ -49,7 +53,7 @@ The application supports nine source-to-destination category operations across *
 4. **Upload Source Data** — Upload the consumer source data file (CSV or Excel) containing the records to be transformed.
 5. **Review Mappings** — Confirm automatic source-to-target column mappings, with the option to override individual mappings.
 6. **Validate** — Execute the full transformation pipeline and review per-record validation results, audit logs, and error reports.
-7. **Export** — Generate and download the populated master workbook, audit report, and error report.
+7. **Export** — Generate the master workbook from eligible rows; failed and review-required rows can be exported separately.
 
 ## Technology Stack
 
@@ -101,7 +105,7 @@ headless = true
 gatherUsageStats = false
 ```
 
-Restart Streamlit after changing `config.toml`.
+Restart Streamlit after changing `config.toml`. The official Windows build is kept at `dist-uan-suffix\\MasterAutomation\\MasterAutomation.exe`.
 
 ### Application configuration
 
@@ -173,11 +177,12 @@ All UUIDs in the output are formatted as `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
 
 ## Output
 
-The application generates three downloadable files:
+The application generates three standard downloads and an optional review-only workbook:
 
 1. **Master Workbook** — A copy of the uploaded template with transformed consumer data populated.
 2. **Audit Report** — Per-record status including transformations applied, hierarchy matches, and lookup results.
 3. **Error Report** — Filtered view of failed, warning, and review-required records.
+4. **Review-only Workbook (optional)** — Failed and review-required rows in a separate workbook, excluded from the eligible master workbook.
 
 ## Audit Statuses
 
@@ -187,7 +192,7 @@ The application generates three downloadable files:
 | `UPDATED`         | Existing record updated                                  |
 | `WARNING`         | Non-critical issues (optional lookup failures)           |
 | `FAILED`          | Critical errors (missing required references)            |
-| `REQUIRES_REVIEW` | Ambiguous matches requiring manual resolution            |
+| `REQUIRES_REVIEW` | Ambiguous matches or suggested corrections not yet accepted |
 
 ## Running Tests
 
@@ -263,7 +268,7 @@ MasterAutomation/
 
 ## Limitations
 
-- The configured upload limit is **3072 MiB (3 GiB)** per file. Successfully uploading a 3 GB file does not guarantee it can be processed — available RAM and disk space are additional constraints. The UI reports memory and disk failures without crashing the workflow.
+- The configured upload limit is **3072 MiB (3 GiB)** per file. The UI estimates memory use before processing, but actual use depends on file shape and available system resources. Large Excel workbooks can expand substantially when loaded.
 - There is no Docker, reverse-proxy, or cloud deployment configuration in this repository. The application is designed to run locally with Streamlit.
 - The target template must be an Excel workbook. CSV cannot replace the template because it requires multiple worksheets including `ref_project_masters_lov`.
 - Hierarchy disambiguation depends on parent-level codes. If all parent codes are identical across duplicate entries, the match is flagged as ambiguous for manual review.

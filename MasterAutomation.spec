@@ -35,14 +35,12 @@ hiddenimports = [
     'streamlit.web.bootstrap',
     'streamlit.web.cli',
     'streamlit.runtime',
-    'streamlit.runtime.scriptrunner.magic_expressions',
     'streamlit.web.server.starlette.starlette_static_routes',
     'openpyxl',
     'openpyxl.cell._writer',
     'pandas',
     'starlette',
     'uvicorn',
-    'tornado',
 ] + streamlit_submodules + uvicorn_submodules + starlette_submodules + anyio_submodules + app_submodules
 
 a = Analysis(
@@ -73,7 +71,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

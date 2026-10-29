@@ -7,6 +7,8 @@ hierarchy matching, or other transformation rules.
 from __future__ import annotations
 
 import html
+import ctypes
+import os
 import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -47,6 +49,8 @@ RESULT_KEYS = (
     "pipeline_result",
     "output_bytes",
     "output_name",
+    "review_bytes",
+    "review_name",
     "audit_bytes",
     "error_bytes",
     "audit_name",
@@ -82,6 +86,52 @@ def format_file_size(size: Optional[int]) -> str:
 
 def upload_limit_caption() -> str:
     return f"Maximum file size: {MAX_UPLOAD_SIZE_LABEL} per file"
+
+
+def available_memory_bytes() -> Optional[int]:
+    """Return currently available physical memory where the OS exposes it."""
+    if os.name == "nt":
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        try:
+            status = _MemoryStatus()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullAvailPhys)
+        except (AttributeError, OSError, TypeError):
+            pass
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        available_pages = os.sysconf("SC_AVPHYS_PAGES")
+        return int(page_size * available_pages)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def estimate_peak_memory_bytes(
+    source_size: Optional[int],
+    source_is_csv: bool,
+    hierarchy_size: Optional[int],
+    template_size: Optional[int],
+) -> int:
+    """Conservative peak estimate for pandas records, indexes, audits, and Excel output."""
+    source_multiplier = 30 if source_is_csv else 60
+    return (
+        max(0, int(source_size or 0)) * source_multiplier
+        + max(0, int(hierarchy_size or 0)) * 12
+        + max(0, int(template_size or 0)) * 5
+        + 512 * 1024 * 1024
+    )
 
 
 def operation_explanation(op: Operation) -> str:

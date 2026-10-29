@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import openpyxl
+from openpyxl.utils import get_column_letter
 
 from .config import Category, DATA_START_ROW, TEXT_IDENTIFIER_FIELDS, UUID_FIELDS
 
@@ -49,6 +50,11 @@ def write_output_workbook(
             ws.cell(row=1, column=col_idx).value = header
 
     data_start = DATA_START_ROW if preserve_type_hint_row else 2
+    for col_idx, header in enumerate(target_headers, 1):
+        if header.lower().strip() in TEXT_IDENTIFIER_FIELDS:
+            column = ws.column_dimensions[get_column_letter(col_idx)]
+            column.width = max(column.width or 0, 20)
+
     if ws.max_row >= data_start:
         for row in range(data_start, ws.max_row + 1):
             for col in range(1, len(target_headers) + 1):

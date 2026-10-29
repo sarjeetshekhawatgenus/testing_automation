@@ -31,12 +31,12 @@ Simply double-click [`build.bat`](build.bat) in the project root.
 
 ### Option B: Command Line
 ```powershell
-python -m PyInstaller --noconfirm --clean MasterAutomation.spec
+python -m PyInstaller --noconfirm --clean --distpath dist-uan-suffix MasterAutomation.spec
 ```
 
-The resulting application will be located in:
+The one official application build will be located in:
 ```text
-dist\MasterAutomation\
+dist-uan-suffix\MasterAutomation\
 ├── MasterAutomation.exe    <-- Main desktop executable
 └── _internal\              <-- Python runtime, DLLs, and Streamlit assets
 ```
@@ -48,7 +48,7 @@ dist\MasterAutomation\
 ## 3. Running the Desktop Application
 
 ### Method 1: Compiled Executable (`.exe`)
-Run `dist\MasterAutomation\MasterAutomation.exe`.
+Run `dist-uan-suffix\MasterAutomation\MasterAutomation.exe`.
 - Starts the embedded server.
 - Opens your browser automatically to the modern UI.
 - All dependencies, Python runtime, and assets are self-contained.
@@ -64,7 +64,7 @@ Double-click [`MasterAutomation.bat`](MasterAutomation.bat) in the project root.
 To share the application with non-technical users on other Windows PCs:
 1. Open the `dist` directory.
 2. Right-click the `MasterAutomation` folder → **Compress to ZIP file**.
-3. Name it `MasterAutomation-v3.4.1-Windows.zip`.
+3. Name it `MasterAutomation-v3.5.0-Windows.zip`.
 4. The recipient simply extracts the ZIP file and double-clicks `MasterAutomation.exe`. Python does **not** need to be installed on their PC.
 
 **⚠️ CRITICAL:** Do NOT distribute the onefile build (`MasterAutomation-Standalone.exe`) - it will fail on other systems with "Not Found" errors because Streamlit cannot properly locate its static assets when extracted to temporary directories. Always use the folder-based distribution.

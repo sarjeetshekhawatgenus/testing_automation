@@ -6,10 +6,9 @@ import csv
 import logging
 import shutil
 import tempfile
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, List, Optional, Sequence, Tuple, Union
+from typing import BinaryIO, Iterator, List, Optional, Sequence, Tuple, Union
 
 import openpyxl
 import pandas as pd
@@ -279,7 +278,7 @@ def _normalise_csv_frame(df: pd.DataFrame) -> pd.DataFrame:
     ):
         raise FileLoadError("The CSV file is missing a header row.")
     for col in df.columns:
-        df[col] = df[col].map(lambda v: v.strip() if isinstance(v, str) else ("" if v is None else str(v)))
+        df[col] = df[col].fillna("").astype(str).str.strip()
     return df
 
 
@@ -330,6 +329,62 @@ def read_csv_data(filepath: str, encoding: str = "utf-8-sig") -> pd.DataFrame:
     ) from last_error
 
 
+def _csv_read_settings(filepath: str) -> Tuple[str, str]:
+    raw = _read_sample_bytes(filepath)
+    if not raw.strip():
+        raise FileLoadError(f'The CSV file "{Path(filepath).name}" is empty.')
+    sample_text, encoding = _decode_sample(raw)
+    return encoding, _detect_delimiter(sample_text)
+
+
+def read_csv_headers(filepath: str) -> List[str]:
+    """Read only the CSV header row, without loading consumer records."""
+    encoding, delimiter = _csv_read_settings(filepath)
+    columns = pd.read_csv(
+        filepath,
+        dtype=str,
+        encoding=encoding,
+        sep=delimiter,
+        keep_default_na=False,
+        na_filter=False,
+        quoting=csv.QUOTE_MINIMAL,
+        nrows=0,
+    ).columns
+    headers = [str(column).replace("\ufeff", "").strip() for column in columns]
+    if not headers or all(not header for header in headers):
+        raise FileLoadError(f'The CSV file "{Path(filepath).name}" is missing a header row.')
+    return headers
+
+
+def iter_csv_data_chunks(
+    filepath: str,
+    chunksize: int = CSV_CHUNK_SIZE,
+) -> Iterator[pd.DataFrame]:
+    """Yield normalized CSV data chunks to bound source-file memory use."""
+    path = Path(filepath)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+    if path.stat().st_size == 0:
+        raise FileLoadError(f'The CSV file "{path.name}" is empty.')
+    encoding, delimiter = _csv_read_settings(filepath)
+    reader = pd.read_csv(
+        filepath,
+        dtype=str,
+        encoding=encoding,
+        sep=delimiter,
+        keep_default_na=False,
+        na_filter=False,
+        quoting=csv.QUOTE_MINIMAL,
+        chunksize=chunksize,
+    )
+    try:
+        for chunk in reader:
+            yield _normalise_csv_frame(chunk)
+    finally:
+        if hasattr(reader, "close"):
+            reader.close()
+
+
 def inspect_csv_file(filepath: str, chunksize: int = CSV_CHUNK_SIZE) -> TabularInspection:
     path = Path(filepath)
     if not path.exists():
@@ -355,7 +410,6 @@ def inspect_csv_file(filepath: str, chunksize: int = CSV_CHUNK_SIZE) -> TabularI
     preview_rows: List[pd.DataFrame] = []
     row_count = 0
     key_col: Optional[str] = None
-    key_counts: Counter = Counter()
     try:
         for chunk in reader:
             chunk = _normalise_csv_frame(chunk)
@@ -366,10 +420,6 @@ def inspect_csv_file(filepath: str, chunksize: int = CSV_CHUNK_SIZE) -> TabularI
             remaining = TABLE_PREVIEW_ROWS - sum(len(p) for p in preview_rows)
             if remaining > 0:
                 preview_rows.append(chunk.head(remaining))
-            if key_col and key_col in chunk.columns:
-                for value in chunk[key_col].astype(str).str.strip():
-                    if value and value.lower() != "nan":
-                        key_counts[value] += 1
             del chunk
     finally:
         if hasattr(reader, "close"):
@@ -377,7 +427,6 @@ def inspect_csv_file(filepath: str, chunksize: int = CSV_CHUNK_SIZE) -> TabularI
     if not headers:
         raise FileLoadError(f'The CSV file "{path.name}" is missing a header row.')
     preview = pd.concat(preview_rows, ignore_index=True) if preview_rows else pd.DataFrame(columns=headers)
-    dup_count = sum(1 for count in key_counts.values() if count > 1)
     return TabularInspection(
         headers=headers,
         row_count=row_count,
@@ -385,7 +434,7 @@ def inspect_csv_file(filepath: str, chunksize: int = CSV_CHUNK_SIZE) -> TabularI
         encoding=encoding,
         delimiter=delimiter,
         is_csv=True,
-        duplicate_key_count=dup_count,
+        duplicate_key_count=0,
         key_column=key_col,
     )
 
@@ -409,8 +458,6 @@ def inspect_excel_sheet(filepath: str, sheet_name: str) -> TabularInspection:
         preview_data: List[List[str]] = []
         row_count = 0
         key_col = _business_key_column(headers)
-        key_index = headers.index(key_col) if key_col and key_col in headers else -1
-        key_counts: Counter = Counter()
         for raw in rows:
             values = ["" if v is None else str(v).strip() for v in raw[:len(headers)]]
             if not any(values):
@@ -418,19 +465,14 @@ def inspect_excel_sheet(filepath: str, sheet_name: str) -> TabularInspection:
             row_count += 1
             if len(preview_data) < TABLE_PREVIEW_ROWS:
                 preview_data.append(values)
-            if key_index >= 0 and key_index < len(values):
-                key = values[key_index]
-                if key and key.lower() != "nan":
-                    key_counts[key] += 1
         preview = pd.DataFrame(preview_data, columns=headers)
-        dup_count = sum(1 for count in key_counts.values() if count > 1)
         return TabularInspection(
             headers=headers,
             row_count=row_count,
             preview=preview,
             is_csv=False,
             sheet_name=sheet_name,
-            duplicate_key_count=dup_count,
+            duplicate_key_count=0,
             key_column=key_col,
         )
     finally:
@@ -453,7 +495,7 @@ def read_hierarchy_file(filepath: str) -> pd.DataFrame:
     else:
         raise FileLoadError(f"Unsupported hierarchy file format: {ext}")
     for col in df.columns:
-        df[col] = df[col].map(lambda v: v.strip() if isinstance(v, str) else v)
+        df[col] = df[col].map(lambda value: value.strip() if isinstance(value, str) else value)
     return df
 
 

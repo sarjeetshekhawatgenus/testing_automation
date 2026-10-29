@@ -127,6 +127,22 @@ def _run(op_src: str, op_dst: str, source_rows: list[dict], tmpdir: str | None =
     return result
 
 
+def _run_with_hierarchy(op_src: str, op_dst: str, source_rows: list[dict], hierarchy_df: pd.DataFrame):
+    d = _tmpdir()
+    tpl = _template_path(d)
+    hier = os.path.join(d, "hierarchy.csv")
+    hierarchy_df.to_csv(hier, index=False, encoding="utf-8-sig")
+    src = _source_excel(d, source_rows)
+    return run_pipeline(
+        template_path=tpl,
+        target_sheet="HTCT Consumer Master",
+        operation=operation(op_src, op_dst),
+        hierarchy_path=hier,
+        source_path=src,
+        source_sheet="Sheet1",
+    )
+
+
 # ── all 9 operations smoke tests ─────────────────────────────────────────────
 
 
@@ -341,6 +357,125 @@ class TestHierarchyResolution:
         rec = result.records[0]
         # DT UUID should be empty, not invented
         assert rec.get("dt_name", "").strip() == "" or "DOESNOTEXIST" not in rec.get("dt_name", "")
+
+    def test_feeder_only_source_does_not_inherit_arbitrary_dt(self, hierarchy_df):
+        row = _base_source_row()
+        row.pop("DT Code")
+        row["Feeder Code"] = "1085140"
+        result = _run_with_hierarchy("WC", "HTCT", [row], hierarchy_df)
+        rec = result.records[0]
+        assert rec["feeder_name"] == f"{{{FEEDER_ID}}}"
+        assert rec["dt_name"] == ""
+        assert rec["dt_code"] == ""
+        dt_field = next(
+            field for field in result.audit.entries[0].field_resolutions
+            if field.target_field == "dt_name"
+        )
+        assert dt_field.status == "UNRESOLVED"
+        assert "Feeder Code" in dt_field.source_field
+
+
+def test_mandatory_blank_source_is_reported_and_not_successful():
+    result = _run("WC", "HTCT", [_base_source_row(**{"Consumer Name": ""})])
+    assert result.records[0]["consumer_name"] == ""
+    assert not result.ready_for_output
+    field = next(
+        item for item in result.audit.entries[0].field_resolutions
+        if item.target_field == "consumer_name"
+    )
+    assert field.status == "UNRESOLVED"
+    assert field.mandatory
+    assert field.source_field == "Consumer Name"
+    report = result.audit.get_field_error_report()
+    assert "Consumer Name" in set(report["Source Field"])
+
+
+def test_absent_mandatory_source_column_is_not_substituted():
+    row = _base_source_row()
+    row.pop("Consumer Name")
+    result = _run("WC", "HTCT", [row])
+    assert result.records[0]["consumer_name"] == ""
+    assert not result.ready_for_output
+    field = next(
+        item for item in result.audit.entries[0].field_resolutions
+        if item.target_field == "consumer_name"
+    )
+    assert field.status == "UNRESOLVED"
+    assert field.source_field == ""
+    assert field.mandatory
+
+
+def test_invalid_direct_uuid_is_left_blank_and_marked_invalid():
+    row = _base_source_row(**{"Response ID": "NOT-A-UUID"})
+    result = _run("WC", "HTCT", [row])
+    assert result.records[0]["id"] == ""
+    field = next(
+        item for item in result.audit.entries[0].field_resolutions
+        if item.target_field == "id"
+    )
+    assert field.status == "INVALID"
+    assert field.source_field == "Response ID"
+
+
+def test_conflicting_source_aliases_do_not_choose_first_column():
+    row = _base_source_row(**{"Consumer UAN": "FIRST", "Consumer UAN Suffix": "SECOND"})
+    result = _run("WC", "HTCT", [row])
+    assert result.records[0]["consumer_uan_suffix"] == ""
+    assert not result.ready_for_output
+    field = next(
+        item for item in result.audit.entries[0].field_resolutions
+        if item.target_field == "consumer_uan_suffix"
+    )
+    assert field.status == "AMBIGUOUS"
+    assert set(field.source_field.split("; ")) == {"Consumer UAN", "Consumer UAN Suffix"}
+
+
+def test_optional_reference_without_match_is_blank_and_audited():
+    result = _run(
+        "WC",
+        "HTCT",
+        [_base_source_row(**{"Geographical Area": "UNLISTED AREA"})],
+    )
+    assert result.records[0]["geographical_are"] == ""
+    field = next(
+        item for item in result.audit.entries[0].field_resolutions
+        if item.target_field == "geographical_are"
+    )
+    assert field.status == "UNRESOLVED"
+    assert field.source_field == "Geographical Area"
+    assert "not found" in field.reason.lower()
+
+
+def test_several_missing_values_stay_blank_without_fallbacks():
+    row = _base_source_row(**{
+        "Meter Serial No": "",
+        "Meter Make": "",
+        "Geographical Area": "",
+        "DT Code": "NO-SUCH-DT",
+    })
+    result = _run("WC", "HTCT", [row])
+    record = result.records[0]
+    assert record["meter_serial_no"] == ""
+    assert record["meter_make"] == ""
+    assert record["geographical_are"] == ""
+    assert record["dt_name"] == ""
+    field_status = {
+        item.target_field: item.status
+        for item in result.audit.entries[0].field_resolutions
+    }
+    assert field_status["meter_serial_no"] == "UNRESOLVED"
+    assert field_status["meter_make"] == "UNRESOLVED"
+    assert field_status["geographical_are"] == "UNRESOLVED"
+
+
+def test_valid_source_values_are_preserved():
+    result = _run(
+        "WC",
+        "HTCT",
+        [_base_source_row(**{"Consumer Number": "C-TRACE-01", "Consumer Name": "Known Consumer"})],
+    )
+    assert result.records[0]["consumer_number"] == "C-TRACE-01"
+    assert result.records[0]["consumer_name"] == "Known Consumer"
 
 
 # ── Duplicate consumer keys ──────────────────────────────────────────────────
@@ -658,3 +793,110 @@ class TestMeterCategoryAlwaysMainMeter:
         assert any("invalid" in (err or "").lower() or "Main Meter" in (err or "") for err in entry.errors)
         assert "not-a-valid-uuid" not in result.records[0].get("meter_category", "")
         assert not result.ready_for_output
+
+
+# ── is_old_mtr_available regression (canonical vs alias category) ────────────
+
+
+class TestIsOldMtrAvailableCanonicalLookup:
+    """Regression: source 'Yes' for is_old_mtr_available must resolve to the
+    canonical 'IS OLD METER AVAILABLE' UUID even when the template's reference
+    sheet also contains a misspelled 'IS OLD METER AVAILABE' with a different
+    UUID.  The old code combined both categories, making 'Yes' ambiguous and
+    silently writing a blank."""
+
+    OLD_MTR_YES_UUID = "9a2b42b2-44d3-4f25-8d1d-432b316f0bb3"
+    MISSPELLED_YES_UUID = "deadbeef-dead-beef-dead-beefdeadbeef"
+
+    def _make_template_with_misspelled_category(self, tmpdir: str) -> str:
+        """Template containing both canonical and misspelled categories."""
+        path = os.path.join(tmpdir, "template_misspell.xlsx")
+        make_template_workbook(path)
+        from openpyxl import load_workbook
+        wb = load_workbook(path)
+        ref = wb["ref_project_masters_lov"]
+        # Add misspelled category rows with a DIFFERENT UUID for "Yes"
+        ref.append([self.MISSPELLED_YES_UUID, "Yes", "1", "IS OLD METER AVAILABE"])
+        ref.append(["abcdef01-2345-6789-abcd-ef0123456789", "No", "2", "IS OLD METER AVAILABE"])
+        wb.save(path)
+        wb.close()
+        return path
+
+    def test_source_yes_resolves_to_canonical_uuid(self):
+        """Source 'Yes' must produce the canonical UUID, not blank."""
+        d = _tmpdir()
+        tpl = self._make_template_with_misspelled_category(d)
+        result = _run_with_template(
+            "WC", "HTCT",
+            [_base_source_row(**{"Is Old Meter Available?": "Yes"})],
+            tpl, d,
+        )
+        rec = result.records[0]
+        output = rec.get("is_old_mtr_available", "").strip()
+        # Must NOT be blank
+        assert output, (
+            "is_old_mtr_available is blank; the lookup was probably treated as "
+            "ambiguous across canonical and misspelled categories"
+        )
+        # Must resolve to the canonical category's UUID
+        assert output == f"{{{self.OLD_MTR_YES_UUID}}}", (
+            f"Expected canonical UUID {{{self.OLD_MTR_YES_UUID}}}, got {output}"
+        )
+
+    def test_source_no_resolves_to_canonical_uuid(self):
+        """Source 'No' also uses the canonical category."""
+        d = _tmpdir()
+        tpl = self._make_template_with_misspelled_category(d)
+        result = _run_with_template(
+            "WC", "HTCT",
+            [_base_source_row(**{"Is Old Meter Available?": "No"})],
+            tpl, d,
+        )
+        rec = result.records[0]
+        output = rec.get("is_old_mtr_available", "").strip()
+        assert output, "is_old_mtr_available is blank for 'No'"
+        from tests.conftest import IS_OLD_MTR_NO_ID
+        assert output == f"{{{IS_OLD_MTR_NO_ID}}}"
+
+    def test_canonical_only_template_yes_resolves(self):
+        """With no misspelled category at all, 'Yes' still resolves."""
+        result = _run("WC", "HTCT", [_base_source_row(**{"Is Old Meter Available?": "Yes"})])
+        rec = result.records[0]
+        output = rec.get("is_old_mtr_available", "").strip()
+        assert output == f"{{{self.OLD_MTR_YES_UUID}}}"
+
+    def test_alias_value_y_resolves_to_yes(self):
+        """VALUE_ALIASES maps 'Y' → 'Yes', which should then resolve."""
+        result = _run("WC", "HTCT", [_base_source_row(**{"Is Old Meter Available?": "Y"})])
+        rec = result.records[0]
+        output = rec.get("is_old_mtr_available", "").strip()
+        assert output == f"{{{self.OLD_MTR_YES_UUID}}}", (
+            f"Value alias 'Y' → 'Yes' should resolve; got {output}"
+        )
+
+    def test_meter_category_still_main_meter(self):
+        """Unrelated rule: meter_category must still be Main Meter."""
+        d = _tmpdir()
+        tpl = self._make_template_with_misspelled_category(d)
+        result = _run_with_template(
+            "WC", "HTCT",
+            [_base_source_row(**{"Is Old Meter Available?": "Yes"})],
+            tpl, d,
+        )
+        rec = result.records[0]
+        assert rec.get("meter_category", "").strip() == f"{{{MAIN_METER_ID}}}"
+
+    def test_consumer_identy_esc_to_tod_preserved(self):
+        """Unrelated rule: ESC → TOD consumer identification is unchanged."""
+        d = _tmpdir()
+        tpl = self._make_template_with_misspelled_category(d)
+        result = _run_with_template(
+            "WC", "HTCT",
+            [_base_source_row(**{
+                "Is Old Meter Available?": "Yes",
+                "Consumer Identification": "ESC",
+            })],
+            tpl, d,
+        )
+        rec = result.records[0]
+        assert rec.get("consumer_identy", "").strip() == f"{{{TOD_ID}}}"

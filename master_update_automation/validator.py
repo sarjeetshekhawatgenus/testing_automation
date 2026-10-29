@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Set
 
@@ -19,6 +20,8 @@ from .reference_lookup import ReferenceLookup
 from .uuid_utils import is_valid_uuid, uuid_output_is_canonical
 
 logger = logging.getLogger(__name__)
+
+_SCIENTIFIC_IDENTIFIER = re.compile(r"^[+-]?\d+(?:\.\d+)?e[+-]?\d+$", re.IGNORECASE)
 
 
 @dataclass
@@ -110,9 +113,12 @@ def validate_reference_categories(
 def validate_source_data(
     source_df: pd.DataFrame,
     required_source_columns: Set[str],
+    row_count: int | None = None,
+    allow_empty_frame: bool = False,
 ) -> ValidationReport:
     report = ValidationReport()
-    if source_df.empty:
+    record_count = len(source_df) if row_count is None else int(row_count)
+    if source_df.empty and record_count == 0 and not allow_empty_frame:
         report.add_error("consumer", "Source data is empty")
         return report
     source_cols_lower = {c.lower().strip() for c in source_df.columns}
@@ -123,7 +129,39 @@ def validate_source_data(
                 f"Required source column '{req_col}' not found",
                 field=req_col,
             )
-    report.add_info("consumer", f"Source data has {len(source_df)} records")
+    if record_count:
+        report.add_info("consumer", f"Source data has {record_count} records")
+    return report
+
+
+def validate_consumer_identifiers(
+    source_df: pd.DataFrame,
+    key_column: str,
+) -> ValidationReport:
+    """Flag identifiers already represented as scientific notation in the source."""
+    report = ValidationReport()
+    if key_column not in source_df.columns:
+        return report
+    matches = []
+    for row_index, value in zip(source_df.index, source_df[key_column].tolist()):
+        text = str(value or "").strip()
+        if _SCIENTIFIC_IDENTIFIER.fullmatch(text):
+            matches.append((int(row_index) + 2, text))
+    if matches:
+        report.add_warning(
+            "consumer",
+            f"{len(matches)} consumer identifier(s) are already written in scientific notation. "
+            "The app will preserve the supplied text, but cannot recover digits lost before upload.",
+            field=key_column,
+        )
+        for row_number, value in matches[:100]:
+            report.add_warning(
+                "consumer",
+                "Consumer identifier is in scientific notation; check the original source value.",
+                field=key_column,
+                row=row_number,
+                value=value,
+            )
     return report
 
 

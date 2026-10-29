@@ -22,3 +22,14 @@ def test_missing_mandatory_source_columns_reported():
     result = create_column_mapping(["Foo"], ["consumer_number", "consumer_name"])
     assert "consumer_number" in result.unmapped_target
     assert "consumer_name" in result.unmapped_target
+
+
+def test_alias_columns_for_one_target_are_not_selected_by_header_order():
+    result = create_column_mapping(
+        ["Consumer UAN", "Consumer UAN Suffix"],
+        ["consumer_uan_suffix"],
+    )
+    assert not result.mappings
+    assert result.ambiguous_mappings == [
+        ("consumer_uan_suffix", ["Consumer UAN", "Consumer UAN Suffix"])
+    ]

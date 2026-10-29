@@ -4,19 +4,25 @@ from __future__ import annotations
 
 import html
 import io
+import re
+import threading
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 
 import pandas as pd
 import streamlit as st
 
 from .column_mapper import create_column_mapping
+from . import __version__
 from .config import (
     HIERARCHY_EXTENSIONS,
     OPERATIONS,
     REFERENCE_SHEET_NAME,
     SOURCE_EXTENSIONS,
+    TEXT_IDENTIFIER_FIELDS,
     TEMPLATE_EXTENSIONS,
 )
 from .excel_writer import write_output_workbook
@@ -40,11 +46,12 @@ from .ui_support import (
     ENGINE_MANDATORY_SOURCE_TARGETS,
     ENGINE_POPULATED_TARGETS,
     MAX_TABLE_PREVIEW_ROWS,
-    PROCESSING_STAGES,
     UI_OPERATION_GROUPS,
     WORKFLOW_STEPS,
     action_counts,
+    available_memory_bytes,
     compute_step_statuses,
+    estimate_peak_memory_bytes,
     file_fingerprint,
     format_file_size,
     humanize_exception,
@@ -906,6 +913,8 @@ def _init_state() -> None:
         "pipeline_result": None,
         "output_bytes": None,
         "output_name": None,
+        "review_bytes": None,
+        "review_name": None,
         "audit_bytes": None,
         "audit_name": None,
         "error_bytes": None,
@@ -913,6 +922,9 @@ def _init_state() -> None:
         "mapping_confirmed": False,
         "processing": False,
         "run_stamp": None,
+        "pipeline_job": None,
+        "pipeline_error": None,
+        "pipeline_error_detail": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -920,8 +932,189 @@ def _init_state() -> None:
 
 
 def _clear_results() -> None:
+    job = st.session_state.get("pipeline_job")
+    if job:
+        job["cancel_event"].set()
     invalidate_processing_results(st.session_state)
     st.session_state.run_stamp = None
+    st.session_state.pipeline_error = None
+    st.session_state.pipeline_error_detail = None
+
+
+class ProcessingCancelled(Exception):
+    """Raised when the user cancels an active validation run."""
+
+
+def _store_pipeline_result(job_result) -> None:
+    result, stamp, audit_bytes, error_bytes = job_result
+    op = OPERATIONS[st.session_state.operation_id]
+    st.session_state.run_stamp = stamp
+    st.session_state.pipeline_result = result
+    st.session_state.audit_bytes = audit_bytes
+    st.session_state.audit_name = report_filename(op, "audit", stamp)
+    st.session_state.error_bytes = error_bytes
+    st.session_state.error_name = report_filename(op, "errors", stamp)
+    st.session_state.output_bytes = None
+    st.session_state.output_name = None
+    st.session_state.review_bytes = None
+    st.session_state.review_name = None
+    st.session_state.pipeline_error = None
+    st.session_state.pipeline_error_detail = None
+
+
+def _start_pipeline_job(approved_rows=None) -> None:
+    op = OPERATIONS[st.session_state.operation_id]
+    template_path = st.session_state.template_path
+    target_sheet = st.session_state.target_sheet
+    hierarchy_path = st.session_state.hierarchy_path
+    source_path = st.session_state.source_path
+    source_sheet = None if st.session_state.source_is_csv else st.session_state.source_sheet
+    source_row_count_hint = st.session_state.source_row_count
+    custom_map = dict(st.session_state.custom_map or {})
+    progress_state = {"message": "Starting validation…", "fraction": 0.0}
+    started_at = monotonic()
+    progress_lock = threading.Lock()
+    cancel_event = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="masterautomation")
+
+    def report_progress(message: str) -> None:
+        if cancel_event.is_set():
+            raise ProcessingCancelled("Validation cancelled by user.")
+        fraction = 0.0
+        match = re.search(r"Processing records:\s*([\d,]+)\s*/\s*([\d,]+)", message)
+        if match:
+            total = int(match.group(2).replace(",", ""))
+            done = int(match.group(1).replace(",", ""))
+            fraction = done / total if total else 0.0
+            elapsed = max(0.1, monotonic() - started_at)
+            rate = done / elapsed
+            eta = (total - done) / rate if rate else 0.0
+            message = f"{message} · {rate:,.0f} rows/s · about {eta:,.0f}s remaining"
+        with progress_lock:
+            progress_state["message"] = message
+            progress_state["fraction"] = fraction
+
+    def run_and_prepare_reports():
+        result = run_pipeline(
+            template_path=template_path,
+            target_sheet=target_sheet,
+            operation=op,
+            hierarchy_path=hierarchy_path,
+            source_path=source_path,
+            source_sheet=source_sheet,
+            custom_map=custom_map,
+            progress=report_progress,
+            approved_hierarchy_rows=set(approved_rows or ()),
+            source_row_count_hint=source_row_count_hint,
+        )
+        report_progress("Preparing audit and error reports")
+        stamp = datetime.now()
+        audit_buffer = io.BytesIO()
+        with pd.ExcelWriter(audit_buffer, engine="openpyxl") as writer:
+            result.audit.to_dataframe().to_excel(writer, sheet_name="Record Audit", index=False)
+            result.audit.to_field_dataframe().to_excel(writer, sheet_name="Field Audit", index=False)
+        error_buffer = io.BytesIO()
+        with pd.ExcelWriter(error_buffer, engine="openpyxl") as writer:
+            result.audit.get_error_report().to_excel(writer, sheet_name="Record Issues", index=False)
+            result.audit.get_field_error_report().to_excel(writer, sheet_name="Field Issues", index=False)
+        report_progress("Validation and reports complete")
+        return result, stamp, audit_buffer.getvalue(), error_buffer.getvalue()
+
+    future = executor.submit(run_and_prepare_reports)
+    st.session_state.pipeline_job = {
+        "future": future,
+        "executor": executor,
+        "cancel_event": cancel_event,
+        "progress_state": progress_state,
+        "progress_lock": progress_lock,
+    }
+    st.session_state.pipeline_error = None
+    st.session_state.pipeline_error_detail = None
+    st.session_state.processing = True
+
+
+@st.fragment(run_every="1s")
+def _render_pipeline_job() -> None:
+    job = st.session_state.get("pipeline_job")
+    if not job:
+        return
+    with job["progress_lock"]:
+        message = job["progress_state"]["message"]
+        fraction = job["progress_state"]["fraction"]
+    st.progress(min(1.0, max(0.0, fraction)), text=message)
+    if not job["future"].done():
+        if st.button("Cancel validation", key="cancel_validation"):
+            job["cancel_event"].set()
+            st.info("Cancellation requested. The app will stop at the next processing checkpoint.")
+        return
+
+    try:
+        result = job["future"].result()
+        _store_pipeline_result(result)
+    except ProcessingCancelled:
+        st.session_state.pipeline_error = "Validation was cancelled. No new result was generated."
+        st.session_state.pipeline_error_detail = ""
+    except MemoryError as exc:
+        st.session_state.pipeline_error = (
+            "The current environment does not have enough memory to process this file. "
+            "Reduce the file size or close other applications, then try again."
+        )
+        st.session_state.pipeline_error_detail = str(exc)
+    except Exception as exc:
+        user_message, detail = humanize_exception(exc, "source")
+        st.session_state.pipeline_error = user_message
+        st.session_state.pipeline_error_detail = detail
+    finally:
+        job["executor"].shutdown(wait=False, cancel_futures=True)
+        st.session_state.pipeline_job = None
+        st.session_state.processing = False
+    st.rerun(scope="app")
+
+
+def _render_hierarchy_correction_review(result) -> None:
+    review_rows = []
+    for entry in result.audit.entries:
+        if entry.hierarchy_status != "REQUIRES_REVIEW" or not entry.hierarchy_corrections:
+            continue
+        parts = [
+            f"{item.get('level', '').title()} {item.get('kind', '')}: "
+            f"{item.get('source_value', '')} → {item.get('suggested_value', '')}"
+            for item in entry.hierarchy_corrections
+        ]
+        review_rows.append({
+            "Accept suggested correction": False,
+            "Source row": entry.source_row,
+            "Consumer number": entry.business_key,
+            "Suggested hierarchy correction": "; ".join(parts),
+        })
+    if not review_rows:
+        return
+    st.markdown("**Review suggested hierarchy corrections**")
+    st.caption(
+        "The app found a unique hierarchy path, but it will not count that row as resolved "
+        "until you accept the suggested correction. Blank source details stay blank."
+    )
+    edited = st.data_editor(
+        pd.DataFrame(review_rows),
+        hide_index=True,
+        use_container_width=True,
+        disabled=["Source row", "Consumer number", "Suggested hierarchy correction"],
+        column_config={
+            "Accept suggested correction": st.column_config.CheckboxColumn(
+                "Accept suggested correction",
+                help="Approve the hierarchy values shown for this consumer.",
+            ),
+        },
+        key=f"hierarchy_review_{st.session_state.run_stamp}",
+    )
+    selected = edited.loc[edited["Accept suggested correction"] == True, "Source row"].tolist()
+    if st.button(
+        f"Accept selected corrections and revalidate ({len(selected)})",
+        disabled=not selected or st.session_state.processing,
+        key="accept_hierarchy_corrections",
+    ):
+        _start_pipeline_job({int(row) for row in selected})
+        st.rerun()
 
 
 def _issue_expander(title: str, detail: str) -> None:
@@ -966,7 +1159,7 @@ def _step_heading(index: int, title: str, lede: str) -> None:
                 Runtime: <strong>Python 3.11+</strong>
               </span>
               <span class="mda-telemetry-pill">
-                Engine: <strong>v3.4.1 Strict</strong>
+                Engine: <strong>v{__version__}</strong>
               </span>
             </div>
           </div>
@@ -997,13 +1190,45 @@ def _file_card(name: str, size, kind: str, status: str, status_class: str, extra
 
 
 
+def _display_identifier_value(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return format(value, ".0f")
+    return str(value).strip()
+
+
 def _preview_frame(df: pd.DataFrame, caption: str) -> None:
     if df is None or df.empty:
         st.caption("No rows to display.")
         return
-    shown = df.head(MAX_TABLE_PREVIEW_ROWS)
+    shown = df.head(MAX_TABLE_PREVIEW_ROWS).copy()
+    for column in shown.columns:
+        if pd.api.types.is_object_dtype(shown[column].dtype):
+            # Streamlit serializes tables through Arrow. Mixed Python values
+            # (for example, integer row numbers and text diagnostics) must be
+            # normalized for display or Arrow can reject the whole table.
+            shown[column] = shown[column].map(_display_identifier_value)
+    identifier_columns = {}
+    for column in shown.columns:
+        normalized = str(column).strip().lower().replace(" ", "_")
+        if normalized not in TEXT_IDENTIFIER_FIELDS and normalized not in {
+            "consumer_no",
+            "account_no",
+        }:
+            continue
+        shown[column] = shown[column].map(_display_identifier_value)
+        identifier_columns[column] = st.column_config.TextColumn(
+            str(column),
+            width="medium",
+        )
     st.caption(f"{caption} Showing {len(shown)} of {len(df)} rows.")
-    st.dataframe(shown, use_container_width=True, hide_index=True)
+    st.dataframe(
+        shown,
+        use_container_width=True,
+        hide_index=True,
+        column_config=identifier_columns,
+    )
 
 
 def step_template() -> None:
@@ -1548,59 +1773,40 @@ def step_dry_run() -> None:
     st.markdown("**Run summary**")
     _run_summary()
 
+    estimated_memory = estimate_peak_memory_bytes(
+        st.session_state.source_size,
+        st.session_state.source_is_csv,
+        st.session_state.hierarchy_size,
+        st.session_state.template_size,
+    )
+    available_memory = available_memory_bytes()
+    memory_text = f"Estimated peak memory: {format_file_size(estimated_memory)}"
+    if available_memory is not None:
+        memory_text += f" · currently available: {format_file_size(available_memory)}"
+    st.caption(memory_text)
+    if available_memory is not None and estimated_memory > available_memory:
+        st.warning(
+            "This run may exceed currently available memory. The estimate is conservative; "
+            "close other applications or use smaller input files if processing fails."
+        )
+
     busy = bool(st.session_state.processing)
     if st.button("Run validation", type="primary", disabled=busy):
-        st.session_state.processing = True
-        try:
-            with st.status("Processing records…", expanded=True) as status:
-                def _progress(message: str) -> None:
-                    status.write(message)
+        _start_pipeline_job()
+        st.rerun()
 
-                result = run_pipeline(
-                    template_path=st.session_state.template_path,
-                    target_sheet=st.session_state.target_sheet,
-                    operation=op,
-                    hierarchy_path=st.session_state.hierarchy_path,
-                    source_path=st.session_state.source_path,
-                    source_sheet=None if st.session_state.source_is_csv else st.session_state.source_sheet,
-                    custom_map=st.session_state.custom_map or None,
-                    progress=_progress,
-                )
-                _progress(PROCESSING_STAGES[-1])
-                stamp = datetime.now()
-                st.session_state.run_stamp = stamp
-                st.session_state.pipeline_result = result
-                audit_df = result.audit.to_dataframe()
-                buf = io.BytesIO()
-                audit_df.to_excel(buf, index=False)
-                st.session_state.audit_bytes = buf.getvalue()
-                st.session_state.audit_name = report_filename(op, "audit", stamp)
-                err_df = result.audit.get_error_report()
-                ebuf = io.BytesIO()
-                err_df.to_excel(ebuf, index=False)
-                st.session_state.error_bytes = ebuf.getvalue()
-                st.session_state.error_name = report_filename(op, "errors", stamp)
-                st.session_state.output_bytes = None
-                st.session_state.output_name = None
-                status.update(label="Validation finished", state="complete")
-        except MemoryError as exc:
-            st.error(
-                "The current environment does not have enough memory to process this file. "
-                "Reduce the file size or run on a machine with more RAM."
-            )
-            _issue_expander("Technical details", str(exc))
-            _clear_results()
-        except Exception as exc:
-            user_msg, detail = humanize_exception(exc, "source")
-            st.error(user_msg)
-            _issue_expander("Technical details", detail)
-            _clear_results()
-        finally:
-            st.session_state.processing = False
+    if st.session_state.pipeline_job:
+        _render_pipeline_job()
+        return
+    if st.session_state.pipeline_error:
+        st.error(st.session_state.pipeline_error)
+        if st.session_state.pipeline_error_detail:
+            _issue_expander("Technical details", st.session_state.pipeline_error_detail)
 
     result = st.session_state.pipeline_result
     if result:
         _render_results(result)
+        _render_hierarchy_correction_review(result)
         if st.session_state.audit_bytes:
             st.download_button(
                 "Download audit report",
@@ -1683,6 +1889,8 @@ def _render_results(result) -> None:
     with tab_audit:
         st.markdown("**Record-level audit stream**")
         _preview_frame(result.audit.to_dataframe(), "Record-level audit.")
+        st.markdown("**Field-level value traceability**")
+        _preview_frame(result.audit.to_field_dataframe(), "Field-level audit.")
 
     with tab_info:
         infos = [i for i in result.validation.issues if i.severity == "INFO"]
@@ -1708,41 +1916,83 @@ def step_output() -> None:
     _render_results(result)
     if not result.ready_for_output:
         st.error(
-            "A workbook can still be generated for review, but this run is not a successful master update. "
-            "Failed and review records remain in the audit report."
+            "This run is not a successful full master update. Unresolved and failed rows will be "
+            "kept out of the master workbook and listed in the review report."
         )
-    include_failed = st.checkbox("Include FAILED / REQUIRES_REVIEW rows in the workbook", value=True)
+    unresolved = [
+        (record, entry)
+        for record, entry in zip(result.records, result.audit.entries)
+        if entry.status in {"FAILED", "REQUIRES_REVIEW"}
+    ]
+    eligible = [
+        record for record, entry in zip(result.records, result.audit.entries)
+        if entry.status not in {"FAILED", "REQUIRES_REVIEW"}
+    ]
+    st.info(
+        f"Master workbook: {len(eligible):,} eligible rows. "
+        f"Rows needing review: {len(unresolved):,}."
+    )
+    make_review_workbook = st.checkbox(
+        "Also create a separate review-only workbook for failed and unresolved rows",
+        value=False,
+        disabled=not unresolved,
+    )
     busy = bool(st.session_state.processing)
-    if st.button("Generate output workbook", type="primary", disabled=busy):
+    if st.button(
+        "Generate output workbook",
+        type="primary",
+        disabled=busy or (not eligible and not make_review_workbook),
+    ):
         st.session_state.processing = True
         try:
             with st.status("Writing output workbook…", expanded=True) as status:
-                status.write("Writing the output workbook")
-                records = result.records
-                if not include_failed:
-                    records = [
-                        rec for rec, entry in zip(result.records, result.audit.entries)
-                        if entry.status not in {"FAILED", "REQUIRES_REVIEW"}
-                    ]
                 stamp = st.session_state.run_stamp or datetime.now()
                 out_name = output_workbook_name(op, stamp)
-                tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
-                try:
-                    write_output_workbook(
-                        template_path=st.session_state.template_path,
-                        target_sheet=st.session_state.target_sheet,
-                        output_records=records,
-                        output_path=tmp_out,
-                        target_headers=result.template_schema.headers,
-                        preserve_type_hint_row=result.template_schema.has_type_hint_row,
-                    )
-                    st.session_state.output_bytes = Path(tmp_out).read_bytes()
-                    st.session_state.output_name = out_name
-                finally:
-                    remove_temp_file(tmp_out)
+                if eligible:
+                    status.write("Writing the eligible master workbook")
+                    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
+                    try:
+                        write_output_workbook(
+                            template_path=st.session_state.template_path,
+                            target_sheet=st.session_state.target_sheet,
+                            output_records=eligible,
+                            output_path=tmp_out,
+                            target_headers=result.template_schema.headers,
+                            preserve_type_hint_row=result.template_schema.has_type_hint_row,
+                        )
+                        st.session_state.output_bytes = Path(tmp_out).read_bytes()
+                        st.session_state.output_name = out_name
+                    finally:
+                        remove_temp_file(tmp_out)
+                else:
+                    st.session_state.output_bytes = None
+                    st.session_state.output_name = None
+                st.session_state.review_bytes = None
+                st.session_state.review_name = None
+                if make_review_workbook and unresolved:
+                    status.write("Writing the separate review-only workbook")
+                    review_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
+                    try:
+                        write_output_workbook(
+                            template_path=st.session_state.template_path,
+                            target_sheet=st.session_state.target_sheet,
+                            output_records=[record for record, _ in unresolved],
+                            output_path=review_path,
+                            target_headers=result.template_schema.headers,
+                            preserve_type_hint_row=result.template_schema.has_type_hint_row,
+                        )
+                        st.session_state.review_bytes = Path(review_path).read_bytes()
+                        st.session_state.review_name = out_name.replace(
+                            ".xlsx", "_REVIEW_ONLY.xlsx"
+                        )
+                    finally:
+                        remove_temp_file(review_path)
                 status.write("Preparing download")
                 status.update(label="Workbook ready", state="complete")
-                st.success(f"Created {out_name} with {len(records)} data rows.")
+                if eligible:
+                    st.success(f"Created {out_name} with {len(eligible):,} eligible data rows.")
+                else:
+                    st.success("No rows qualified for the master workbook; the review-only workbook is ready.")
         except MemoryError as exc:
             st.error(
                 "The current environment does not have enough memory to write the output workbook. "
@@ -1751,18 +2001,24 @@ def step_output() -> None:
             _issue_expander("Technical details", str(exc))
             st.session_state.output_bytes = None
             st.session_state.output_name = None
+            st.session_state.review_bytes = None
+            st.session_state.review_name = None
         except OSError as exc:
             user_msg, detail = humanize_exception(exc, "output")
             st.error(user_msg)
             _issue_expander("Technical details", detail)
             st.session_state.output_bytes = None
             st.session_state.output_name = None
+            st.session_state.review_bytes = None
+            st.session_state.review_name = None
         except Exception as exc:
             user_msg, detail = humanize_exception(exc, "output")
             st.error(user_msg)
             _issue_expander("Technical details", detail)
             st.session_state.output_bytes = None
             st.session_state.output_name = None
+            st.session_state.review_bytes = None
+            st.session_state.review_name = None
         finally:
             st.session_state.processing = False
 
@@ -1789,7 +2045,17 @@ def step_output() -> None:
             )
             st.caption(f"{st.session_state.output_name} ({format_file_size(len(st.session_state.output_bytes))})")
         else:
-            st.caption("Workbook is available after generation.")
+            st.caption("Eligible master workbook is available after generation.")
+        if st.session_state.review_bytes:
+            st.download_button(
+                "Review-only workbook",
+                data=st.session_state.review_bytes,
+                file_name=st.session_state.review_name or "review_only.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="Failed and unresolved rows, separated from the master workbook.",
+                use_container_width=True,
+                key="dl_review_only",
+            )
     with d2:
         st.markdown(
             """
@@ -1844,14 +2110,14 @@ def main() -> None:
     _inject_css()
     _init_state()
     st.markdown(
-        """
+        f"""
         <div class="mda-topbar">
           <div class="mda-topbar-brand">
             <div class="mda-mark">MDA</div>
             <div class="mda-title-wrap">
               <div class="mda-title-row">
                 <h1 class="mda-title">Master Data Automation</h1>
-                <span class="mda-version-pill">v3.4.1 Strict</span>
+                <span class="mda-version-pill">v{__version__}</span>
               </div>
               <p class="mda-kicker">Consumer Master Update System &middot; Transform consumer records, resolve network hierarchy, validate reference data</p>
             </div>

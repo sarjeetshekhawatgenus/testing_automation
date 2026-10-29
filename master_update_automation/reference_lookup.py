@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -15,7 +16,7 @@ from .config import (
     REFERENCE_CATEGORY_MAP,
     REFERENCE_SHEET_NAME,
 )
-from .uuid_utils import normalise_uuid
+from .uuid_utils import is_valid_uuid, normalise_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ class LookupResult:
     category: str = ""
     search_value: str = ""
     is_ambiguous: bool = False
+    is_invalid: bool = False
 
 
 class ReferenceLookup:
@@ -46,6 +48,8 @@ class ReferenceLookup:
         self._by_name: Dict[Tuple[str, str], List[ReferenceEntry]] = {}
         self._by_code: Dict[Tuple[str, str], List[ReferenceEntry]] = {}
         self._duplicate_keys: List[str] = []
+        self._lookup_cache: OrderedDict = OrderedDict()
+        self._lookup_cache_limit = 100_000
 
     def load_from_workbook(self, wb) -> None:
         if REFERENCE_SHEET_NAME not in wb.sheetnames:
@@ -81,13 +85,18 @@ class ReferenceLookup:
         self._load_rows(rows)
 
     def load_from_dataframe(self, df: pd.DataFrame) -> None:
+        def cell_text(value) -> str:
+            if value is None or pd.isna(value):
+                return ""
+            return str(value).strip()
+
         rows = []
-        for _, row in df.iterrows():
+        for row in df.to_dict(orient="records"):
             rows.append({
-                "id": str(row.get("id", "") or "").strip(),
-                "name": str(row.get("name", "") or "").strip(),
-                "code": str(row.get("code", "") or "").strip(),
-                "master_name": str(row.get("master_name", "") or "").strip(),
+                "id": cell_text(row.get("id", "")),
+                "name": cell_text(row.get("name", "")),
+                "code": cell_text(row.get("code", "")),
+                "master_name": cell_text(row.get("master_name", "")),
             })
         self._load_rows(rows)
 
@@ -97,11 +106,12 @@ class ReferenceLookup:
         self._by_name.clear()
         self._by_code.clear()
         self._duplicate_keys.clear()
+        self._lookup_cache.clear()
 
         for row in rows:
             entry_id = row.get("id", "")
             master_name = row.get("master_name", "")
-            if not master_name or not entry_id:
+            if not master_name:
                 continue
             entry = ReferenceEntry(
                 id=entry_id,
@@ -144,7 +154,19 @@ class ReferenceLookup:
         return self._by_category.get(category.upper(), [])
 
     def _unique_entry(self, entries: List[ReferenceEntry], category: str, value: str) -> LookupResult:
-        ids = {e.id.lower() for e in entries}
+        invalid_entries = [entry for entry in entries if not is_valid_uuid(entry.id)]
+        if invalid_entries:
+            return LookupResult(
+                success=False,
+                is_invalid=True,
+                error=(
+                    f"Reference value '{value}' in category '{category}' has "
+                    "a missing or invalid UUID"
+                ),
+                category=category,
+                search_value=value,
+            )
+        ids = {normalise_uuid(e.id).lower() for e in entries}
         if len(ids) > 1:
             return LookupResult(
                 success=False,
@@ -156,6 +178,8 @@ class ReferenceLookup:
                 category=category,
                 search_value=value,
             )
+        # All remaining candidates carry the same valid UUID, so choosing a
+        # representative cannot change the output identifier.
         entry = entries[0]
         return LookupResult(
             success=True,
@@ -166,6 +190,16 @@ class ReferenceLookup:
         )
 
     def lookup_by_name(self, category: str, name: str) -> LookupResult:
+        cache_key = ("name", str(category or "").upper(), str(name or "").strip().upper())
+        cached = self._lookup_cache.get(cache_key)
+        if cached is not None:
+            self._lookup_cache.move_to_end(cache_key)
+            return replace(cached)
+        result = self._lookup_by_name_uncached(category, name)
+        self._cache_lookup_result(cache_key, result)
+        return replace(result)
+
+    def _lookup_by_name_uncached(self, category: str, name: str) -> LookupResult:
         if not name or not category:
             return LookupResult(
                 success=False,
@@ -175,17 +209,37 @@ class ReferenceLookup:
             )
         cat_upper = category.upper()
         name_upper = str(name).strip().upper()
-        categories_to_try = [cat_upper]
-        for alias in REFERENCE_CATEGORY_ALIASES.get(cat_upper, []):
-            categories_to_try.append(alias.upper())
+        # Prefer entries under the exact requested category. A template may
+        # contain both a canonical category and a misspelled legacy category;
+        # combining them can make a valid value (for example, "Yes") appear
+        # ambiguous when the two rows have different UUIDs.
+        name_entries = self._by_name.get((cat_upper, name_upper), [])
+        if name_entries:
+            return self._unique_entry(name_entries, category, name)
+        code_entries = self._by_code.get((cat_upper, name_upper), [])
+        if code_entries:
+            return self._unique_entry(code_entries, category, name)
 
-        for cat in categories_to_try:
-            name_entries = self._by_name.get((cat, name_upper), [])
-            if name_entries:
-                return self._unique_entry(name_entries, category, name)
-            code_entries = self._by_code.get((cat, name_upper), [])
-            if code_entries:
-                return self._unique_entry(code_entries, category, name)
+        # Fall back to alternate category spellings only when the canonical
+        # category has no matching name or code.
+        alias_categories = [
+            alias.upper()
+            for alias in REFERENCE_CATEGORY_ALIASES.get(cat_upper, [])
+        ]
+        name_entries = [
+            entry
+            for alias in alias_categories
+            for entry in self._by_name.get((alias, name_upper), [])
+        ]
+        if name_entries:
+            return self._unique_entry(name_entries, category, name)
+        code_entries = [
+            entry
+            for alias in alias_categories
+            for entry in self._by_code.get((alias, name_upper), [])
+        ]
+        if code_entries:
+            return self._unique_entry(code_entries, category, name)
 
         return LookupResult(
             success=False,
@@ -195,6 +249,16 @@ class ReferenceLookup:
         )
 
     def lookup_by_code(self, category: str, code: str) -> LookupResult:
+        cache_key = ("code", str(category or "").upper(), str(code or "").strip().upper())
+        cached = self._lookup_cache.get(cache_key)
+        if cached is not None:
+            self._lookup_cache.move_to_end(cache_key)
+            return replace(cached)
+        result = self._lookup_by_code_uncached(category, code)
+        self._cache_lookup_result(cache_key, result)
+        return replace(result)
+
+    def _lookup_by_code_uncached(self, category: str, code: str) -> LookupResult:
         if not code or not category:
             return LookupResult(
                 success=False,
@@ -213,6 +277,15 @@ class ReferenceLookup:
             category=category,
             search_value=code,
         )
+
+    def _cache_lookup_result(
+        self,
+        key: Tuple[str, str, str],
+        result: LookupResult,
+    ) -> None:
+        self._lookup_cache[key] = replace(result)
+        if len(self._lookup_cache) > self._lookup_cache_limit:
+            self._lookup_cache.popitem(last=False)
 
     def lookup_meter_make(self, dest_category: Category, meter_make_name: str) -> LookupResult:
         ref_category = METER_MAKE_REFERENCE.get(dest_category)

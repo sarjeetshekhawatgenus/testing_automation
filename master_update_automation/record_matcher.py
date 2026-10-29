@@ -24,8 +24,8 @@ def detect_duplicate_keys(df: pd.DataFrame, key_column: str) -> Dict[str, List[i
     duplicates: Dict[str, List[int]] = {}
     if key_column not in df.columns:
         return duplicates
-    for idx, row in df.iterrows():
-        key = str(row.get(key_column, "") or "").strip()
+    for idx, raw_key in zip(df.index, df[key_column].tolist()):
+        key = str(raw_key or "").strip()
         if key:
             duplicates.setdefault(key, []).append(idx)
     return {k: v for k, v in duplicates.items() if len(v) > 1}
@@ -42,16 +42,18 @@ def match_records(
     results: List[MatchResult] = []
     target_index: Dict[str, List[int]] = {}
     if target_df is not None and target_key_column in target_df.columns:
-        for idx, row in target_df.iterrows():
-            key = str(row.get(target_key_column, "") or "").strip()
+        for idx, raw_key in zip(target_df.index, target_df[target_key_column].tolist()):
+            key = str(raw_key or "").strip()
             if key:
                 target_index.setdefault(key, []).append(idx)
 
     source_keys_seen: Dict[str, int] = {}
-    for idx, row in source_df.iterrows():
-        key = ""
-        if source_key_column in source_df.columns:
-            key = str(row.get(source_key_column, "") or "").strip()
+    if source_key_column in source_df.columns:
+        source_keys = source_df[source_key_column].tolist()
+    else:
+        source_keys = [""] * len(source_df)
+    for idx, raw_key in zip(source_df.index, source_keys):
+        key = str(raw_key or "").strip()
         if not key:
             results.append(MatchResult(
                 source_index=idx,

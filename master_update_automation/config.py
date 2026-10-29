@@ -65,6 +65,9 @@ REFERENCE_COLUMNS = {
 # Always resolve meter_category from this name in METER CATEGORY (never from source).
 FIXED_METER_CATEGORY_LOOKUP_NAME = "Main Meter"
 
+# Consumer UAN suffix is a fixed target value, independent of source data.
+CONSUMER_UAN_SUFFIX_VALUE = "-1"
+
 # Target column name → reference master_name value
 REFERENCE_CATEGORY_MAP: Dict[str, str] = {
     "meter_category": "METER CATEGORY",
@@ -252,7 +255,7 @@ TARGET_FIELD_TYPES: Dict[str, FieldType] = {
     "old_consumer_number": FieldType.TEXT,
     "consumer_number": FieldType.TEXT,
     "account_number": FieldType.TEXT,
-    "consumer_uan_suffix": FieldType.TEXT,
+    "consumer_uan_suffix": FieldType.BUSINESS_RULE,
     "consumer_name": FieldType.TEXT,
     "father_name": FieldType.TEXT,
     "consumer_address": FieldType.TEXT,

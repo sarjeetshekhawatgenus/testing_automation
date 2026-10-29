@@ -109,7 +109,23 @@ def patch_streamlit_static_dir(base_dir: Path) -> Path | None:
         return None
 
 
+def configure_output_streams() -> None:
+    """Keep diagnostics available when the packaged app has no console window."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        log_path = Path(sys.executable).resolve().parent / "masterautomation.log"
+        stream = open(log_path, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        stream = open(os.devnull, "w")
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+
+
 def main():
+    configure_output_streams()
     base_dir = get_base_dir()
     os.chdir(base_dir)
 

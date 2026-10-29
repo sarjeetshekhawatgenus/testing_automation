@@ -77,6 +77,7 @@ def create_column_mapping(
     mapped_sources: set = set()
     mapped_targets: set = set()
     ambiguous: List[Tuple[str, List[str]]] = []
+    ambiguous_targets: set = set()
 
     target_norm_map: Dict[str, str] = {}
     for th in target_headers:
@@ -84,63 +85,76 @@ def create_column_mapping(
             target_norm_map[normalise_header(th)] = th
 
     if custom_map:
+        custom_by_target: Dict[str, List[str]] = {}
+        target_spelling: Dict[str, str] = {}
         for src, tgt in custom_map.items():
             if src in source_headers and tgt in target_headers:
-                mappings.append(ColumnMapping(
-                    source_column=src,
-                    target_column=tgt,
-                    transformation=_transformation_for(tgt.lower().strip()),
-                    is_confirmed=True,
-                    confidence=1.0,
-                ))
-                mapped_sources.add(src)
-                mapped_targets.add(tgt)
+                key = tgt.lower().strip()
+                custom_by_target.setdefault(key, []).append(src)
+                target_spelling[key] = tgt
+        for key, sources in custom_by_target.items():
+            if len(set(sources)) > 1:
+                ambiguous.append((target_spelling[key], list(dict.fromkeys(sources))))
+                ambiguous_targets.add(key)
+                mapped_sources.update(sources)
+                continue
+            src = sources[0]
+            tgt = target_spelling[key]
+            mappings.append(ColumnMapping(
+                source_column=src,
+                target_column=tgt,
+                transformation=_transformation_for(tgt.lower().strip()),
+                is_confirmed=True,
+                confidence=1.0,
+            ))
+            mapped_sources.add(src)
+            mapped_targets.add(tgt)
 
+    # Gather every automatic candidate before selecting any mapping. Source
+    # header order must not decide which of two fields supplies one output.
+    candidates_by_target: Dict[str, List[Tuple[str, str, float]]] = {}
     for src_header in source_headers:
         if src_header in mapped_sources:
             continue
         src_norm = normalise_header(src_header)
-        if src_norm not in SOURCE_TO_TARGET_MAP:
+        if src_norm in SOURCE_TO_TARGET_MAP:
+            logical_target = SOURCE_TO_TARGET_MAP[src_norm]
+            if logical_target.startswith("_hierarchy_"):
+                target_col = logical_target
+            else:
+                target_col = _actual_target(target_headers, logical_target)
+            confidence = 0.9
+        elif src_norm in target_norm_map:
+            target_col = target_norm_map[src_norm]
+            confidence = 0.8
+        else:
             continue
-        target_col = SOURCE_TO_TARGET_MAP[src_norm]
-        transformation = _transformation_for(target_col)
-        if target_col.startswith("_hierarchy_"):
-            mappings.append(ColumnMapping(
-                source_column=src_header,
-                target_column=target_col,
-                transformation="hierarchy",
-                is_confirmed=True,
-                confidence=0.9,
-            ))
-            mapped_sources.add(src_header)
+        if not target_col:
             continue
-        actual_target = _actual_target(target_headers, target_col)
-        if actual_target and actual_target not in mapped_targets:
-            mappings.append(ColumnMapping(
-                source_column=src_header,
-                target_column=actual_target,
-                transformation=transformation,
-                is_confirmed=True,
-                confidence=0.9,
-            ))
-            mapped_sources.add(src_header)
-            mapped_targets.add(actual_target)
+        key = target_col.lower().strip()
+        if key in ambiguous_targets or target_col in mapped_targets:
+            continue
+        candidates_by_target.setdefault(key, []).append((src_header, target_col, confidence))
 
-    for src_header in source_headers:
-        if src_header in mapped_sources:
+    for key, candidates in candidates_by_target.items():
+        unique_sources = list(dict.fromkeys(src for src, _, _ in candidates))
+        if len(unique_sources) > 1:
+            ambiguous.append((candidates[0][1], unique_sources))
+            ambiguous_targets.add(key)
+            mapped_sources.update(unique_sources)
             continue
-        src_norm = normalise_header(src_header)
-        if src_norm in target_norm_map and target_norm_map[src_norm] not in mapped_targets:
-            actual_target = target_norm_map[src_norm]
-            mappings.append(ColumnMapping(
-                source_column=src_header,
-                target_column=actual_target,
-                transformation=_transformation_for(actual_target.lower().strip()),
-                is_confirmed=True,
-                confidence=0.8,
-            ))
-            mapped_sources.add(src_header)
-            mapped_targets.add(actual_target)
+        src_header, target_col, confidence = candidates[0]
+        transformation = _transformation_for(target_col.lower().strip())
+        mappings.append(ColumnMapping(
+            source_column=src_header,
+            target_column=target_col,
+            transformation=transformation,
+            is_confirmed=True,
+            confidence=confidence,
+        ))
+        mapped_sources.add(src_header)
+        if not target_col.startswith("_hierarchy_"):
+            mapped_targets.add(target_col)
 
     unmapped_source = [s for s in source_headers if s and s not in mapped_sources]
     unmapped_target = [
